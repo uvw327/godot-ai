@@ -1,0 +1,81 @@
+name: Release addon
+
+## Lightweight tag-driven addon packaging, deliberately separate from the
+## upstream two-stage qualification/promotion pipeline (release-qualification
+## → release.yml), which requires signed candidates, environment reviewers,
+## and artifacts from the upstream repository. This workflow only builds the
+## canonical release shape — godot-ai-v4-plugin.zip containing addons/godot_ai/
+## (see script/architecture_simplification_gates.py::_CANONICAL_RELEASE_SHAPE)
+## — and attaches it to a GitHub Release on the pushed tag, so users can
+## download and unzip the addon into their project. It does not sign the
+## archive, so the plugin's self-updater will not adopt it; that is the
+## intended contract, not an oversight.
+
+on:
+  push:
+    tags: ["v*"]
+  ## Manual runs build the zip and upload the workflow artifact; the Release
+  ## is only created/updated when the run ref is a real tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-addon-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GODOT_AI_DISABLE_TELEMETRY: "true"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c18123ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Package addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version="\(.*\)"$/\1/p' plugin/addons/godot_ai/plugin.cfg)"
+          test -n "$version"
+          if [[ "$GITHUB_REF" == refs/tags/* && "v$version" != "$GITHUB_REF_NAME" ]]; then
+            ## A mismatched tag is user error, not a broken package — warn
+            ## loudly instead of failing so the zip still ships.
+            echo "::warning::tag $GITHUB_REF_NAME does not match plugin.cfg version $version"
+          fi
+          cd plugin
+          zip -r ../godot-ai-v4-plugin.zip addons/godot_ai \
+            -x "*/.DS_Store" -x "*/__MACOSX/*"
+          cd ..
+          sha256sum godot-ai-v4-plugin.zip > godot-ai-v4-plugin.zip.sha256
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ## Re-runs of an existing tag refresh the assets instead of failing
+          ## on "release already_exists".
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              godot-ai-v4-plugin.zip godot-ai-v4-plugin.zip.sha256
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Godot AI addon package built from ${GITHUB_SHA}. Unzip into your project so the archive lands at addons/godot_ai/, then enable the plugin in Project Settings → Plugins." \
+              godot-ai-v4-plugin.zip godot-ai-v4-plugin.zip.sha256
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: godot-ai-v4-plugin
+          path: |
+            godot-ai-v4-plugin.zip
+            godot-ai-v4-plugin.zip.sha256
+          if-no-files-found: error
